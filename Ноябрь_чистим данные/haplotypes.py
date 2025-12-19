@@ -1,0 +1,364 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Haplotype heatmaps (unphased inter-gene pairs) for vaccine datasets.
+
+For each vaccine:
+- load phenotype: columns ["ZLIMS ID", "region", f"{VACC}_ME_ml"]
+- keep positive titers, compute log10
+- merge with HLA table on sample_id
+- for a selected gene pair (e.g., HLA-B ~ HLA-DRB1), build unphased pairs via product(allelesA, allelesB)
+- count pairs -> pivot (geneA_allele x geneB_allele) -> heatmap
+- optional filtering by min allele count (marginal frequency threshold)
+- optional per-region heatmaps
+
+This mirrors the approach in haplotypes-HLA.ipynb:
+Counter + product + pivot_table + seaborn.heatmap.
+"""
+
+import argparse
+import os
+from collections import Counter
+from itertools import product
+from typing import Optional, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# seaborn is used in the original notebook; keep it here too.
+try:
+    import seaborn as sns
+    _HAS_SEABORN = True
+except Exception:
+    sns = None
+    _HAS_SEABORN = False
+
+
+# ------------------------------------------------------------
+# Allele normalization (same idea as in your effect-size script)
+# ------------------------------------------------------------
+
+def normalize_allele_first_field(allele: str) -> Optional[str]:
+    if pd.isna(allele):
+        return None
+    allele = str(allele).strip()
+    if allele in ("", "-", "NA", "NaN"):
+        return None
+    if "*" not in allele:
+        return None
+    prefix, rest = allele.split("*", 1)
+    parts = rest.split(":")
+    if not parts or not parts[0]:
+        return None
+    return f"{prefix}*{parts[0]}"
+
+
+def normalize_allele_second_field(allele: str) -> Optional[str]:
+    if pd.isna(allele):
+        return None
+    allele = str(allele).strip()
+    if allele in ("", "-", "NA", "NaN"):
+        return None
+    if "*" not in allele:
+        return None
+    prefix, rest = allele.split("*", 1)
+    parts = rest.split(":")
+    if not parts or not parts[0]:
+        return None
+    if len(parts) == 1:
+        return f"{prefix}*{parts[0]}"
+    return f"{prefix}*{parts[0]}:{parts[1]}"
+
+
+def get_gene_prefixes(df: pd.DataFrame) -> List[str]:
+    """Prefixes like 'HLA-A' from columns 'HLA-A_1', 'HLA-A_2' or 'A_1','A_2'."""
+    cols = [c for c in df.columns if c.endswith("_1") or c.endswith("_2")]
+    return sorted({c.rsplit("_", 1)[0] for c in cols})
+
+
+def resolve_gene_prefix(df: pd.DataFrame, gene: str) -> str:
+    """
+    Try to resolve gene prefix as it appears in HLA table columns.
+    Accepts:
+      - exact prefix (e.g., 'HLA-B' or 'B')
+      - short name without 'HLA-' (e.g., 'DRB1' -> 'HLA-DRB1' if present)
+    """
+    prefixes = set(get_gene_prefixes(df))
+    gene = gene.strip()
+
+    if gene in prefixes:
+        return gene
+
+    if not gene.startswith("HLA-"):
+        g2 = "HLA-" + gene
+        if g2 in prefixes:
+            return g2
+
+    # last attempt: if gene starts with HLA- but table uses short form
+    if gene.startswith("HLA-"):
+        short = gene.replace("HLA-", "")
+        if short in prefixes:
+            return short
+
+    raise ValueError(
+        f"Cannot resolve gene '{gene}' to HLA-table prefixes. "
+        f"Available examples: {sorted(list(prefixes))[:12]} ..."
+    )
+
+
+# ------------------------------------------------------------
+# Loading
+# ------------------------------------------------------------
+
+def load_hla(hla_path: str) -> pd.DataFrame:
+    hla = pd.read_excel(hla_path)
+    if "sample_id" not in hla.columns:
+        raise ValueError("HLA file must contain column 'sample_id'.")
+    hla["sample_id"] = hla["sample_id"].astype(str)
+    return hla
+
+
+def load_vaccine_pheno(vaccine_name: str, path: str) -> pd.DataFrame:
+    df = pd.read_excel(path)
+
+    if "ZLIMS ID" not in df.columns:
+        raise ValueError(f"{path} must contain 'ZLIMS ID' column.")
+    if "region" not in df.columns:
+        raise ValueError(f"{path} must contain 'region' column.")
+
+    tcol = f"{vaccine_name}_ME_ml"
+    if tcol not in df.columns:
+        raise ValueError(f"{path}: column '{tcol}' not found.")
+
+    df["ZLIMS ID"] = df["ZLIMS ID"].astype(str)
+    df["region"] = df["region"].astype(str)
+
+    titers = df[tcol].astype(float).replace([np.inf, -np.inf], np.nan)
+    df = df[titers > 0].copy()
+    df["log_titer"] = np.log10(df[tcol].astype(float))
+
+    return df[["ZLIMS ID", "region", "log_titer"]].copy()
+
+
+def merge_pheno_hla(pheno: pd.DataFrame, hla: pd.DataFrame) -> pd.DataFrame:
+    merged = pheno.merge(hla, left_on="ZLIMS ID", right_on="sample_id", how="inner")
+    if merged.empty:
+        raise ValueError("No overlapping samples between phenotype and HLA tables.")
+    # one row per sample
+    merged = merged.drop_duplicates(subset=["sample_id"]).copy()
+    return merged
+
+
+# ------------------------------------------------------------
+# Haplotype pairs (unphased) and heatmaps
+# ------------------------------------------------------------
+
+def extract_two_alleles(row: pd.Series, gene_prefix: str, normalizer) -> Tuple[Optional[str], Optional[str]]:
+    c1, c2 = f"{gene_prefix}_1", f"{gene_prefix}_2"
+    if c1 not in row.index or c2 not in row.index:
+        return (None, None)
+
+    a1 = normalizer(row[c1])
+    raw2 = row[c2]
+    # preserve your previous convention: "-" in _2 means homozygous as _1
+    if isinstance(raw2, str) and raw2.strip() == "-":
+        a2 = a1
+    else:
+        a2 = normalizer(raw2)
+
+    return (a1, a2)
+
+
+def build_unphased_pairs(
+    merged: pd.DataFrame,
+    gene_a: str,
+    gene_b: str,
+    field: str,
+) -> List[Tuple[str, str]]:
+    """
+    Build all unphased inter-gene pairs (gene_a_allele, gene_b_allele) using product of two alleles each.
+    Mirrors the notebook logic exactly.
+    """
+    normalizer = normalize_allele_first_field if field == "first" else normalize_allele_second_field
+
+    pairs: List[Tuple[str, str]] = []
+    for _, row in merged.iterrows():
+        a1, a2 = extract_two_alleles(row, gene_a, normalizer)
+        b1, b2 = extract_two_alleles(row, gene_b, normalizer)
+
+        alleles_a = sorted([x for x in (a1, a2) if x is not None])
+        alleles_b = sorted([x for x in (b1, b2) if x is not None])
+
+        if not alleles_a or not alleles_b:
+            continue
+
+        pairs.extend(list(product(alleles_a, alleles_b)))
+
+    return pairs
+
+
+def pairs_to_pivot(pairs: List[Tuple[str, str]]) -> pd.DataFrame:
+    ctr = Counter(pairs)
+    if not ctr:
+        return pd.DataFrame()
+
+    df = pd.DataFrame([(a, b, c) for (a, b), c in ctr.items()], columns=["A_allele", "B_allele", "Count"])
+    pivot = df.pivot_table(index="A_allele", columns="B_allele", values="Count", fill_value=0, aggfunc="sum")
+    return pivot
+
+
+def filter_by_min_allele_count(pivot: pd.DataFrame, min_allele_count: int) -> pd.DataFrame:
+    """
+    Filter alleles by marginal count >= threshold.
+    """
+    if pivot.empty or min_allele_count <= 0:
+        return pivot
+
+    row_sum = pivot.sum(axis=1)
+    col_sum = pivot.sum(axis=0)
+
+    keep_rows = row_sum[row_sum >= min_allele_count].index
+    keep_cols = col_sum[col_sum >= min_allele_count].index
+
+    return pivot.loc[keep_rows, keep_cols]
+
+
+def plot_heatmap(pivot: pd.DataFrame, title: str, xlabel: str, ylabel: str, out_png: str, figsize=(14, 9)):
+    if pivot.empty:
+        return
+
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+
+    plt.figure(figsize=figsize)
+
+    if _HAS_SEABORN:
+        sns.heatmap(pivot, linewidths=0.5, cmap="PuBuGn")
+    else:
+        # fallback
+        plt.imshow(pivot.values, aspect="auto")
+        plt.colorbar()
+
+        plt.xticks(ticks=np.arange(pivot.shape[1]), labels=pivot.columns, rotation=90)
+        plt.yticks(ticks=np.arange(pivot.shape[0]), labels=pivot.index)
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=90)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+    print(f"Saved heatmap: {out_png}")
+
+
+# ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Build unphased inter-gene HLA haplotype heatmaps for vaccine datasets."
+    )
+    p.add_argument("--hla", required=True, help="Path to combined_hla_out.xlsx (with sample_id and gene_1/gene_2 columns)")
+    p.add_argument("--field", choices=["first", "second"], default="first", help="Allele resolution (default: first)")
+    p.add_argument(
+        "--vaccine",
+        action="append",
+        required=True,
+        help="Vaccine spec NAME:PATH.xlsx (repeatable), e.g. --vaccine HBV:HBV.xlsx",
+    )
+    p.add_argument("--outdir", required=True, help="Output directory for heatmaps")
+    p.add_argument(
+        "--gene_pair",
+        default="HLA-B,HLA-DRB1",
+        help="Comma-separated gene pair, e.g. 'HLA-B,HLA-DRB1' or 'B,DRB1'. Default: HLA-B,HLA-DRB1",
+    )
+    p.add_argument(
+        "--min_allele_count",
+        type=int,
+        default=0,
+        help="If >0, filter alleles by marginal count >= threshold (like in the notebook frequent-only heatmap).",
+    )
+    p.add_argument(
+        "--by_region",
+        action="store_true",
+        help="Also build heatmaps separately for each region in phenotype.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    hla = load_hla(args.hla)
+
+    # resolve gene pair against the HLA table column prefixes
+    gA_raw, gB_raw = [x.strip() for x in args.gene_pair.split(",", 1)]
+    gA = resolve_gene_prefix(hla, gA_raw)
+    gB = resolve_gene_prefix(hla, gB_raw)
+
+    # parse vaccine specs
+    vaccine_specs: Dict[str, str] = {}
+    for spec in args.vaccine:
+        if ":" not in spec:
+            raise ValueError(f"Invalid --vaccine '{spec}'. Use NAME:PATH.xlsx")
+        name, path = spec.split(":", 1)
+        vaccine_specs[name.strip()] = path.strip()
+
+    for vacc, path in vaccine_specs.items():
+        print(f"\n=== Vaccine: {vacc} ===")
+        pheno = load_vaccine_pheno(vacc, path)
+        merged = merge_pheno_hla(pheno, hla)
+
+        # overall heatmap for vaccine
+        pairs = build_unphased_pairs(merged, gA, gB, args.field)
+        pivot = pairs_to_pivot(pairs)
+        pivot = filter_by_min_allele_count(pivot, args.min_allele_count)
+
+        title = f"{vacc}: {gA} ~ {gB} haplotypes (unphased), field={args.field}"
+        if args.min_allele_count > 0:
+            title += f", min_allele_count={args.min_allele_count}"
+
+        out_png = os.path.join(args.outdir, f"heatmap_{vacc}_{gA.replace('-','')}_{gB.replace('-','')}_{args.field}.png")
+        plot_heatmap(
+            pivot=pivot,
+            title=title,
+            xlabel=f"{gB} allele",
+            ylabel=f"{gA} allele",
+            out_png=out_png,
+            figsize=(14, 9),
+        )
+
+        # per-region heatmaps
+        if args.by_region:
+            for region, subm in merged.groupby("region"):
+                pairs_r = build_unphased_pairs(subm, gA, gB, args.field)
+                pivot_r = pairs_to_pivot(pairs_r)
+                pivot_r = filter_by_min_allele_count(pivot_r, args.min_allele_count)
+
+                title_r = f"{vacc} ({region}): {gA} ~ {gB} haplotypes (unphased), field={args.field}"
+                if args.min_allele_count > 0:
+                    title_r += f", min_allele_count={args.min_allele_count}"
+
+                out_png_r = os.path.join(
+                    args.outdir,
+                    f"heatmap_{vacc}_{region}_{gA.replace('-','')}_{gB.replace('-','')}_{args.field}.png"
+                )
+                plot_heatmap(
+                    pivot=pivot_r,
+                    title=title_r,
+                    xlabel=f"{gB} allele",
+                    ylabel=f"{gA} allele",
+                    out_png=out_png_r,
+                    figsize=(14, 9),
+                )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
