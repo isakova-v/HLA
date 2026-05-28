@@ -1,0 +1,65 @@
+# Python
+venv/
+.pid_aid_env/
+*.pyc
+__pycache__/
+
+# Data files (too large / sensitive for git)
+*.xlsx
+*.csv
+*.tsv
+*.xls
+*.fasta
+
+# Images & plots
+*.png
+*.jpg
+*.jpeg
+
+# Documents
+*.docx
+*.pdf
+*.pptx
+
+# Archives
+*.tar.gz
+*.zip
+
+# Jupyter notebooks (large with embedded outputs)
+*.ipynb
+
+# macOS
+.DS_Store
+
+# Temp Excel lock files
+~$*
+
+# Claude Code project instructions
+CLAUDE.md
+
+# Catboost artifacts
+catboost_info/
+
+# HLA-HD raw results
+hla-hd_*/
+t1k_HLA_*/
+*.tar.gz
+
+# Output directories (generated, not source)
+out_*/
+outputs/
+results/
+hla_pc_reg_out/
+hla_forests/
+vaccine_effects/
+vaccine_effects_by_region/
+vax_plots/
+hla_abz_freqs/
+data_filtered/
+betas_out_*/
+
+# Dashboard / Streamlit
+.streamlit/
+
+# Unrelated
+contest/
